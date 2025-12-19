@@ -95,8 +95,12 @@ func (c *Coordinator) AskAssignment(args protocol.AskAssignmentRequest, reply *p
 }
 
 func (c *Coordinator) FinishAssignment(args protocol.FinishAssignmentRequest, reply *protocol.FinishAssignmentResponse) error {
-	c.am.finishAssignment(&args.A, args.Outputs, args.Source)
+	c.am.finishAssignment(args.Source, args.Outputs)
 	return nil
+}
+
+func (c *Coordinator) DeadTemp(args protocol.DeadTempRequest, reply *protocol.DeadTempResponse) error {
+	return c.am.redoTemp(args.Source, args.Temp)
 }
 
 func (c *Coordinator) server() {
