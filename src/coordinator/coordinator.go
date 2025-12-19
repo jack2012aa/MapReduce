@@ -103,6 +103,15 @@ func (c *Coordinator) DeadTemp(args protocol.DeadTempRequest, reply *protocol.De
 	return c.am.redoTemp(args.Source, args.Temp)
 }
 
+func (c *Coordinator) GetResult(args protocol.GetResultRequest, reply *protocol.GetResultResponse) error {
+	results, err := c.am.getResult(args.TaskID)
+	if err != nil {
+		return err
+	}
+	reply.Output = results
+	return nil
+}
+
 func (c *Coordinator) server() {
 	rpc.Register(c)
 

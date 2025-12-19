@@ -306,3 +306,95 @@ func TestRedoTemp(t *testing.T) {
 		t.Fatalf("task.state should be tDone")
 	}
 }
+
+func TestIntegratedAM(t *testing.T) {
+	tempDir := t.TempDir()
+	small := filepath.Join(tempDir, "small")
+	large := filepath.Join(tempDir, "file2")
+	content := []byte("hello world")
+	var smallMSize int64 = 1
+	smallNMap := len(content) / int(smallMSize)
+	err := os.WriteFile(small, content, 0644)
+	content = []byte("hello world and good night")
+	var largeMSize int64 = 1
+	largeNMap := len(content) / int(largeMSize)
+	err = os.WriteFile(large, content, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name       string
+		r          protocol.StartTaskRequest
+		expNMap    int
+		expNReduce int
+	}{
+		{"small", protocol.StartTaskRequest{small, smallMSize, 10, ""}, smallNMap, 10},
+		{"large", protocol.StartTaskRequest{large, largeMSize, 20, ""}, largeNMap, 20},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			worker := "main"
+			am := newAssignmentManager()
+			id, err := am.addTask(test.r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for range test.expNMap {
+				a := am.assignTask(worker)
+				if a == nil {
+					t.Fatalf("am.assignTask() should return assignment")
+				}
+				if !a.IsMap() {
+					t.Fatalf("missing map assignment")
+				}
+				outputs := make(map[int]string)
+				for i := 0; i < test.expNReduce; i++ {
+					outputs[i] = fmt.Sprintf("offset_%v_hash_%v", a.Map.Offset, i)
+				}
+				am.finishAssignment(worker, outputs)
+			}
+			d, err := am.isTaskDone(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if d {
+				t.Fatalf("task should not be done")
+			}
+
+			for range test.expNReduce {
+				a := am.assignTask(worker)
+				if a == nil {
+					t.Fatalf("am.assignTask() should return assignment")
+				}
+				if a.IsMap() {
+					t.Fatalf("task.assign() should return reduce assignment")
+				}
+				outputs := make(map[int]string)
+				h, err := strconv.Atoi(a.Reduce.Hash)
+				if err != nil {
+					t.Fatal(err)
+				}
+				outputs[h] = fmt.Sprintf("result_hash_%v", h)
+				am.finishAssignment(worker, outputs)
+			}
+			d, err = am.isTaskDone(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !d {
+				t.Fatalf("task should be done")
+			}
+			results, err := am.getResult(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for h, path := range results {
+				if path != fmt.Sprintf("result_hash_%v", h) {
+					t.Fatalf("mismatched result")
+				}
+			}
+		})
+	}
+}

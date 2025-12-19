@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"os"
+	"slices"
 	"strconv"
 	"sync"
 
@@ -34,6 +35,7 @@ func (am *assignmentManager) addTask(r protocol.StartTaskRequest) (protocol.ID, 
 	am.mu.Lock()
 	defer am.mu.Unlock()
 	am.workingTasks = append(am.workingTasks, t)
+	am.idToT[t.id] = t
 	return t.id, nil
 }
 
@@ -45,6 +47,7 @@ func (am *assignmentManager) addTaskFromFiles(inputs []string, nReduce int) (pro
 	am.mu.Lock()
 	defer am.mu.Unlock()
 	am.workingTasks = append(am.workingTasks, t)
+	am.idToT[t.id] = t
 	return t.id, nil
 }
 
@@ -105,7 +108,12 @@ func (am *assignmentManager) finishAssignment(worker string, outputs map[int]str
 		return
 	}
 	delete(am.wToA, worker)
-	go t.finish(a, outputs)
+	t.finish(a, outputs)
+	if t.isDone() || t.isDead() {
+		slices.DeleteFunc(am.workingTasks, func(task *task) bool {
+			return task == t
+		})
+	}
 }
 
 func (am *assignmentManager) redoTemp(worker string, path string) error {
@@ -117,6 +125,19 @@ func (am *assignmentManager) redoTemp(worker string, path string) error {
 		return errors.New("assignment worker not found")
 	}
 	return t.redoTemp(a, path)
+}
+
+func (am *assignmentManager) getResult(id protocol.ID) (map[int]string, error) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	t, ok := am.idToT[id]
+	if !ok {
+		return nil, errors.New("assignment task not found")
+	}
+	if !t.isDone() {
+		return nil, errors.New("assignment task is not done")
+	}
+	return t.results, nil
 }
 
 const (
@@ -158,7 +179,7 @@ type task struct {
 	rA         map[string]*aWrapper
 	inputs     []string
 	temps      map[int][]string
-	results    map[int][]string
+	results    map[int]string
 	tempsToAW  map[string]*aWrapper
 	mu         sync.Mutex
 	state      int
@@ -178,7 +199,7 @@ func makeTask(inputs []string, nReduce int, plugin string, opts ...taskOption) (
 		mA:        make(map[string]*aWrapper, 10),
 		rA:        make(map[string]*aWrapper, nReduce),
 		temps:     make(map[int][]string),
-		results:   make(map[int][]string),
+		results:   make(map[int]string),
 		tempsToAW: make(map[string]*aWrapper),
 	}
 
@@ -304,7 +325,7 @@ func (t *task) finish(a *protocol.Assignment, outputs map[int]string) {
 		aw, ok := t.rA[a.ID()]
 		if ok {
 			for hash, path := range outputs {
-				t.results[hash] = append(t.results[hash], path)
+				t.results[hash] = path
 			}
 			aw.state = aDone
 			t.doneReduce++
