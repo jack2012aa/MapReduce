@@ -32,8 +32,7 @@ func (am *assignmentManager) addTask(r protocol.StartTaskRequest) (*protocol.ID,
 		[]*string{r.Input},
 		r.NReduce,
 		withMapSize(r.MapSize),
-		withMapF(r.MapF),
-		withReduceF(r.ReduceF),
+		withPlugin(r.Plugin),
 	)
 	if err != nil {
 		return nil, err
@@ -173,15 +172,9 @@ func withMapSize(s int64) taskOption {
 	}
 }
 
-func withMapF(f func(string, string) []protocol.KeyValue) taskOption {
+func withPlugin(plugin *string) taskOption {
 	return func(t *task) {
-		t.mapF = f
-	}
-}
-
-func withReduceF(f func(string, []string) string) taskOption {
-	return func(t *task) {
-		t.reduceF = f
+		t.plugin = plugin
 	}
 }
 
@@ -189,10 +182,9 @@ type task struct {
 	mSize      int64
 	nMap       int
 	doneMap    int
-	mapF       func(string, string) []protocol.KeyValue
 	nReduce    int
 	doneReduce int
-	reduceF    func(string, []string) string
+	plugin     *string
 	id         protocol.ID
 	mA         map[string]*aWrapper
 	rA         map[string]*aWrapper
@@ -250,12 +242,12 @@ func (t *task) splitAndSetMA(input *string) error {
 	sBytes := info.Size()
 	for i := int64(0); i < sBytes; i += t.mSize {
 		ma := protocol.MapAssignment{
-			Input:    input,
-			Offset:   i,
-			Length:   t.mSize,
-			Function: t.mapF,
-			NReduce:  t.nReduce,
-			TID:      t.id,
+			Input:   input,
+			Offset:  i,
+			Length:  t.mSize,
+			NReduce: t.nReduce,
+			TID:     t.id,
+			Plugin:  t.plugin,
 		}
 		aw := &aWrapper{a: &ma, state: aReady}
 		t.mA[ma.AssignmentID()] = aw
@@ -268,11 +260,12 @@ func (t *task) splitAndSetMA(input *string) error {
 func (t *task) setMA(inputs []*string) {
 	for _, input := range inputs {
 		ma := protocol.MapAssignment{
-			Input:    input,
-			Offset:   0,
-			Length:   -1,
-			Function: t.mapF,
-			NReduce:  t.nReduce,
+			Input:   input,
+			Offset:  0,
+			Length:  -1,
+			NReduce: t.nReduce,
+			TID:     t.id,
+			Plugin:  t.plugin,
 		}
 		aw := &aWrapper{a: &ma, state: aReady}
 		t.mA[ma.AssignmentID()] = aw
@@ -361,10 +354,10 @@ func (t *task) proceed() {
 			for hash, paths := range t.temps {
 				hs := strconv.Itoa(hash)
 				ra := protocol.ReduceAssignment{
-					Inputs:   paths,
-					Hash:     &hs,
-					TID:      t.id,
-					Function: t.reduceF,
+					Inputs: paths,
+					Hash:   &hs,
+					TID:    t.id,
+					Plugin: t.plugin,
 				}
 				aw := &aWrapper{a: &ra, state: aReady}
 				t.rA[ra.AssignmentID()] = aw

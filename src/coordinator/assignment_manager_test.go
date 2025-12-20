@@ -22,8 +22,6 @@ func TestMakeTask(t *testing.T) {
 	}
 	var mSize int64 = 1
 	nMap := len(content) / int(mSize)
-	mapF := func(k string, c string) []protocol.KeyValue { return nil }
-	reduceF := func(k string, v []string) string { return "" }
 
 	tests := []struct {
 		name     string
@@ -36,7 +34,7 @@ func TestMakeTask(t *testing.T) {
 	}{
 		{"Single File", []*string{&file1}, 10, []taskOption{}, 1, 0, 32 * 1024 * 1024},
 		{"Multiple Files", []*string{&file1, &file2}, 10, []taskOption{}, 2, 0, 32 * 1024 * 1024},
-		{"With", []*string{&file1}, 10, []taskOption{withMapSize(mSize), withMapF(mapF), withReduceF(reduceF)}, nMap, 0, mSize},
+		{"With", []*string{&file1}, 10, []taskOption{withMapSize(mSize), withPlugin(&file1)}, nMap, 0, mSize},
 	}
 
 	for _, test := range tests {
@@ -54,11 +52,8 @@ func TestMakeTask(t *testing.T) {
 			if task.nReduce != test.nReduce {
 				t.Errorf("got nReduce %d, want %d", task.nReduce, test.nReduce)
 			}
-			if task.mapF != nil && len(test.opts) == 0 {
-				t.Errorf("got mapF, want nil")
-			}
-			if task.reduceF != nil && len(test.opts) == 0 {
-				t.Errorf("got reduceF, want nil")
+			if task.plugin != nil && len(test.opts) == 0 {
+				t.Errorf("got plugin, want nil")
 			}
 			if task.mSize != int64(test.expMSize) {
 				t.Errorf("got mSize %d, want %d", task.mSize, test.expMSize)
@@ -349,8 +344,8 @@ func TestIntegratedAM(t *testing.T) {
 		expNMap    int
 		expNReduce int
 	}{
-		{"small", protocol.StartTaskRequest{&small, smallMSize, 10, nil, nil}, smallNMap, 10},
-		{"large", protocol.StartTaskRequest{&large, largeMSize, 20, nil, nil}, largeNMap, 20},
+		{"small", protocol.StartTaskRequest{&small, smallMSize, 10, &small}, smallNMap, 10},
+		{"large", protocol.StartTaskRequest{&large, largeMSize, 20, &large}, largeNMap, 20},
 	}
 
 	for _, test := range tests {

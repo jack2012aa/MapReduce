@@ -18,7 +18,7 @@ type Coordinator struct {
 	mu             sync.Mutex
 }
 
-func MakeCoordinatorDaemon() *Coordinator {
+func MakeCoordinatorDaemon() (*Coordinator, string) {
 	c := Coordinator{
 		lastHeartbeats: make(map[string]time.Time),
 		isAlive:        true,
@@ -26,18 +26,18 @@ func MakeCoordinatorDaemon() *Coordinator {
 		am:             newAssignmentManager(),
 	}
 
-	c.server()
-	return &c
+	addr := c.server()
+	return &c, addr
 }
 
-func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := MakeCoordinatorDaemon()
+func MakeCoordinator(files []string, nReduce int) (*Coordinator, string) {
+	c, addr := MakeCoordinatorDaemon()
 	var filesP []*string
 	for _, file := range files {
 		filesP = append(filesP, &file)
 	}
 	c.am.addTaskFromFiles(filesP, nReduce)
-	return c
+	return c, addr
 }
 
 func (c *Coordinator) StartTask(args protocol.StartTaskRequest, reply *protocol.StartTaskResponse) error {
@@ -124,13 +124,15 @@ func (c *Coordinator) GetResult(args protocol.GetResultRequest, reply *protocol.
 	return nil
 }
 
-func (c *Coordinator) server() {
+func (c *Coordinator) server() string {
 	rpc.Register(c)
 
 	rpc.HandleHTTP()
-	l, err := net.Listen("tcp", ":1234")
+	l, err := net.Listen("tcp", ":0")
 	if err != nil {
 		log.Fatal("listen error:", err)
 	}
+	log.Println("listening on", l.Addr())
 	go http.Serve(l, nil)
+	return l.Addr().String()
 }

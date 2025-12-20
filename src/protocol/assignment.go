@@ -8,10 +8,10 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"plugin"
 	"runtime/debug"
 	"slices"
 	"strconv"
@@ -31,6 +31,25 @@ type KeyValue struct {
 
 type ID uuid.UUID
 
+func loadPlugin(filename *string) (func(string, string) []KeyValue, func(string, []string) string, error) {
+	p, err := plugin.Open(*filename)
+	if err != nil {
+		return nil, nil, err
+	}
+	xmapf, err := p.Lookup("Map")
+	if err != nil {
+		return nil, nil, err
+	}
+	mapf := xmapf.(func(string, string) []KeyValue)
+	xreducef, err := p.Lookup("Reduce")
+	if err != nil {
+		return nil, nil, err
+	}
+	reducef := xreducef.(func(string, []string) string)
+
+	return mapf, reducef, nil
+}
+
 type Assignment interface {
 	Execute(dir string) (outputs map[int]string, err error)
 	SetF(any) error
@@ -45,22 +64,13 @@ type MapAssignment struct {
 	Function func(string, string) []KeyValue
 	NReduce  int
 	TID      ID
+	Plugin   *string
 }
 
 func (a *MapAssignment) ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
-}
-
-func GetOutBoundIp(targetAddr string) (string, error) {
-	conn, err := net.Dial("udp", targetAddr)
-	if err != nil {
-		return "", err
-	}
-	defer conn.Close()
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP.String(), nil
 }
 
 // Execute creates a new directory and maps/reduces the input to some outputs.
@@ -74,7 +84,11 @@ func (a *MapAssignment) Execute(dir string) (outputs map[int]string, err error) 
 		}
 	}()
 	if a.Function == nil {
-		return nil, errors.New("no executable function")
+		mapF, _, err := loadPlugin(a.Plugin)
+		if err != nil {
+			return nil, err
+		}
+		a.Function = mapF
 	}
 
 	input, err := os.Open(*a.Input)
@@ -169,6 +183,7 @@ type ReduceAssignment struct {
 	Hash     *string
 	Function func(string, []string) string
 	TID      ID
+	Plugin   *string
 }
 
 func (a *ReduceAssignment) downloadAndDecode(url string) ([]KeyValue, error) {
@@ -200,6 +215,14 @@ func (a *ReduceAssignment) downloadAndDecode(url string) ([]KeyValue, error) {
 //
 // If it is a reduce assignment, may return FileAccessError
 func (a *ReduceAssignment) Execute(dir string) (outputs map[int]string, err error) {
+	if a.Function == nil {
+		_, reduceF, err := loadPlugin(a.Plugin)
+		if err != nil {
+			return nil, err
+		}
+		a.Function = reduceF
+	}
+
 	var allKVs []KeyValue
 
 	for _, url := range a.Inputs {
