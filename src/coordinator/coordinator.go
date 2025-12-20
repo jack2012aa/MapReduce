@@ -19,11 +19,12 @@ type Coordinator struct {
 }
 
 func MakeCoordinatorDaemon() *Coordinator {
-	c := Coordinator{}
-	c.lastHeartbeats = make(map[string]time.Time)
-	c.isAlive = true
-	c.timeout = time.Second * 10
-	c.am = newAssignmentManager()
+	c := Coordinator{
+		lastHeartbeats: make(map[string]time.Time),
+		isAlive:        true,
+		timeout:        time.Second * 10,
+		am:             newAssignmentManager(),
+	}
 
 	c.server()
 	return &c
@@ -31,7 +32,11 @@ func MakeCoordinatorDaemon() *Coordinator {
 
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := MakeCoordinatorDaemon()
-	c.am.addTaskFromFiles(files, nReduce)
+	var filesP []*string
+	for _, file := range files {
+		filesP = append(filesP, &file)
+	}
+	c.am.addTaskFromFiles(filesP, nReduce)
 	return c
 }
 
@@ -52,10 +57,17 @@ func (c *Coordinator) checkHeartBeat() {
 			now := time.Now()
 			delta := now.Sub(t)
 			if delta > c.timeout {
-				c.am.maybeUnassign(s)
+				c.am.maybeUnassign(&s)
 			}
 		}
 	}
+}
+
+func (c *Coordinator) RegisterWorker(args protocol.RegisterWorkerRequest, reply *protocol.RegisterWorkerResponse) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastHeartbeats[*args.Addr] = time.Now()
+	return nil
 }
 
 func (c *Coordinator) AskTask(args protocol.AskTaskRequest, reply *protocol.AskTaskResponse) error {
@@ -80,16 +92,16 @@ func (c *Coordinator) AskTask(args protocol.AskTaskRequest, reply *protocol.AskT
 func (c *Coordinator) HeartBeat(args protocol.HeartBeatRequest, reply *protocol.HeartBeatResponse) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.lastHeartbeats[args.Source] = time.Now()
+	c.lastHeartbeats[*args.Source] = time.Now()
 	return nil
 }
 
 func (c *Coordinator) AskAssignment(args protocol.AskAssignmentRequest, reply *protocol.AskAssignmentResponse) error {
-	a := c.am.assignTask(args.Source)
+	a := c.am.assignTask(*args.Source)
 	if a == nil {
 		reply.IsEmpty = true
 	} else {
-		reply.A = *a
+		reply.A = a
 	}
 	return nil
 }

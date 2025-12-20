@@ -14,7 +14,7 @@ import (
 
 type assignmentManager struct {
 	workingTasks []*task
-	wToA         map[string]*protocol.Assignment
+	wToA         map[string]protocol.Assignment
 	idToT        map[protocol.ID]*task
 	mu           sync.Mutex
 }
@@ -22,13 +22,31 @@ type assignmentManager struct {
 func newAssignmentManager() *assignmentManager {
 	am := &assignmentManager{}
 	am.workingTasks = []*task{}
-	am.wToA = make(map[string]*protocol.Assignment)
+	am.wToA = make(map[string]protocol.Assignment)
 	am.idToT = make(map[protocol.ID]*task)
 	return am
 }
 
-func (am *assignmentManager) addTask(r protocol.StartTaskRequest) (protocol.ID, error) {
-	t, err := makeTask([]string{r.Input}, r.NReduce, r.Plugin, withMapSize(r.MapSize))
+func (am *assignmentManager) addTask(r protocol.StartTaskRequest) (*protocol.ID, error) {
+	t, err := makeTask(
+		[]*string{r.Input},
+		r.NReduce,
+		withMapSize(r.MapSize),
+		withMapF(r.MapF),
+		withReduceF(r.ReduceF),
+	)
+	if err != nil {
+		return nil, err
+	}
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	am.workingTasks = append(am.workingTasks, t)
+	am.idToT[t.id] = t
+	return &t.id, nil
+}
+
+func (am *assignmentManager) addTaskFromFiles(inputs []*string, nReduce int) (protocol.ID, error) {
+	t, err := makeTask(inputs, nReduce)
 	if err != nil {
 		return protocol.ID{}, err
 	}
@@ -39,50 +57,38 @@ func (am *assignmentManager) addTask(r protocol.StartTaskRequest) (protocol.ID, 
 	return t.id, nil
 }
 
-func (am *assignmentManager) addTaskFromFiles(inputs []string, nReduce int) (protocol.ID, error) {
-	t, err := makeTask(inputs, nReduce, "")
-	if err != nil {
-		return protocol.ID{}, err
-	}
+func (am *assignmentManager) maybeUnassign(worker *string) {
 	am.mu.Lock()
 	defer am.mu.Unlock()
-	am.workingTasks = append(am.workingTasks, t)
-	am.idToT[t.id] = t
-	return t.id, nil
-}
-
-func (am *assignmentManager) maybeUnassign(worker string) {
-	am.mu.Lock()
-	defer am.mu.Unlock()
-	a, ok := am.wToA[worker]
+	a, ok := am.wToA[*worker]
 	if ok {
-		delete(am.wToA, worker)
+		delete(am.wToA, *worker)
 	}
-	t := am.idToT[a.TaskID]
+	t := am.idToT[a.TaskID()]
 	t.cancel(a)
 }
 
-func (am *assignmentManager) isTaskDone(tID protocol.ID) (bool, error) {
+func (am *assignmentManager) isTaskDone(tID *protocol.ID) (bool, error) {
 	am.mu.Lock()
 	defer am.mu.Unlock()
-	t, ok := am.idToT[tID]
+	t, ok := am.idToT[*tID]
 	if !ok {
 		return false, errors.New("task not found")
 	}
 	return t.isDone(), nil
 }
 
-func (am *assignmentManager) isTaskDead(tID protocol.ID) (bool, error) {
+func (am *assignmentManager) isTaskDead(tID *protocol.ID) (bool, error) {
 	am.mu.Lock()
 	defer am.mu.Unlock()
-	t, ok := am.idToT[tID]
+	t, ok := am.idToT[*tID]
 	if !ok {
 		return false, errors.New("task not found")
 	}
 	return t.isDead(), nil
 }
 
-func (am *assignmentManager) assignTask(worker string) *protocol.Assignment {
+func (am *assignmentManager) assignTask(worker string) protocol.Assignment {
 	am.mu.Lock()
 	defer am.mu.Unlock()
 	for _, t := range am.workingTasks {
@@ -94,20 +100,20 @@ func (am *assignmentManager) assignTask(worker string) *protocol.Assignment {
 	return nil
 }
 
-func (am *assignmentManager) finishAssignment(worker string, outputs map[int]string) {
+func (am *assignmentManager) finishAssignment(worker *string, outputs map[int]*string) {
 	am.mu.Lock()
 	defer am.mu.Unlock()
-	a, ok := am.wToA[worker]
+	a, ok := am.wToA[*worker]
 	if !ok {
 		log.Println("assignment worker not found")
 		return
 	}
-	t, ok := am.idToT[a.TaskID]
+	t, ok := am.idToT[a.TaskID()]
 	if !ok {
 		log.Println("assignment task not found")
 		return
 	}
-	delete(am.wToA, worker)
+	delete(am.wToA, *worker)
 	t.finish(a, outputs)
 	if t.isDone() || t.isDead() {
 		slices.DeleteFunc(am.workingTasks, func(task *task) bool {
@@ -116,21 +122,21 @@ func (am *assignmentManager) finishAssignment(worker string, outputs map[int]str
 	}
 }
 
-func (am *assignmentManager) redoTemp(worker string, path string) error {
+func (am *assignmentManager) redoTemp(worker *string, path *string) error {
 	am.mu.Lock()
 	defer am.mu.Unlock()
-	a, ok := am.wToA[worker]
-	t := am.idToT[a.TaskID]
+	a, ok := am.wToA[*worker]
+	t := am.idToT[a.TaskID()]
 	if !ok {
 		return errors.New("assignment worker not found")
 	}
 	return t.redoTemp(a, path)
 }
 
-func (am *assignmentManager) getResult(id protocol.ID) (map[int]string, error) {
+func (am *assignmentManager) getResult(id *protocol.ID) (map[int]*string, error) {
 	am.mu.Lock()
 	defer am.mu.Unlock()
-	t, ok := am.idToT[id]
+	t, ok := am.idToT[*id]
 	if !ok {
 		return nil, errors.New("assignment task not found")
 	}
@@ -155,7 +161,7 @@ const (
 )
 
 type aWrapper struct {
-	a     *protocol.Assignment
+	a     protocol.Assignment
 	state int
 }
 
@@ -167,19 +173,32 @@ func withMapSize(s int64) taskOption {
 	}
 }
 
+func withMapF(f func(string, string) []protocol.KeyValue) taskOption {
+	return func(t *task) {
+		t.mapF = f
+	}
+}
+
+func withReduceF(f func(string, []string) string) taskOption {
+	return func(t *task) {
+		t.reduceF = f
+	}
+}
+
 type task struct {
 	mSize      int64
 	nMap       int
 	doneMap    int
+	mapF       func(string, string) []protocol.KeyValue
 	nReduce    int
 	doneReduce int
-	plugin     string
+	reduceF    func(string, []string) string
 	id         protocol.ID
 	mA         map[string]*aWrapper
 	rA         map[string]*aWrapper
 	inputs     []string
-	temps      map[int][]string
-	results    map[int]string
+	temps      map[int][]*string
+	results    map[int]*string
 	tempsToAW  map[string]*aWrapper
 	mu         sync.Mutex
 	state      int
@@ -190,16 +209,15 @@ type task struct {
 // If len(inputs) = 1, the input file is split to appropriate size
 //
 // If len(inputs) > 1, map assignments are created for each input file
-func makeTask(inputs []string, nReduce int, plugin string, opts ...taskOption) (*task, error) {
+func makeTask(inputs []*string, nReduce int, opts ...taskOption) (*task, error) {
 	t := &task{
 		mSize:     32 * 1024 * 1024,
 		nReduce:   nReduce,
-		plugin:    plugin,
 		id:        protocol.ID(uuid.New()),
 		mA:        make(map[string]*aWrapper, 10),
 		rA:        make(map[string]*aWrapper, nReduce),
-		temps:     make(map[int][]string),
-		results:   make(map[int]string),
+		temps:     make(map[int][]*string),
+		results:   make(map[int]*string),
 		tempsToAW: make(map[string]*aWrapper),
 	}
 
@@ -208,12 +226,12 @@ func makeTask(inputs []string, nReduce int, plugin string, opts ...taskOption) (
 	}
 
 	if len(inputs) == 1 {
-		err := t.splitAndSetMA(inputs[0], plugin)
+		err := t.splitAndSetMA(inputs[0])
 		if err != nil {
 			return nil, err
 		}
 	} else if len(inputs) > 1 {
-		t.setMA(inputs, plugin)
+		t.setMA(inputs)
 	} else {
 		return nil, errors.New("inputs are required")
 	}
@@ -222,8 +240,8 @@ func makeTask(inputs []string, nReduce int, plugin string, opts ...taskOption) (
 }
 
 // This function is not thread-safe and should only be called in the constructor
-func (t *task) splitAndSetMA(input string, plugin string) error {
-	info, err := os.Stat(input)
+func (t *task) splitAndSetMA(input *string) error {
+	info, err := os.Stat(*input)
 	if err != nil {
 		t.kill()
 		return errors.New("err when getting task info")
@@ -232,29 +250,32 @@ func (t *task) splitAndSetMA(input string, plugin string) error {
 	sBytes := info.Size()
 	for i := int64(0); i < sBytes; i += t.mSize {
 		ma := protocol.MapAssignment{
-			Input:  input,
-			Offset: i,
-			Length: t.mSize,
-			Plugin: plugin,
+			Input:    input,
+			Offset:   i,
+			Length:   t.mSize,
+			Function: t.mapF,
+			NReduce:  t.nReduce,
+			TID:      t.id,
 		}
-		aw := &aWrapper{a: &protocol.Assignment{Map: ma, TaskID: t.id}, state: aReady}
-		t.mA[aw.a.ID()] = aw
+		aw := &aWrapper{a: &ma, state: aReady}
+		t.mA[ma.AssignmentID()] = aw
 	}
 	t.nMap = len(t.mA)
 	return nil
 }
 
 // This function is not thread-safe and should only be called in the constructor
-func (t *task) setMA(inputs []string, plugin string) {
+func (t *task) setMA(inputs []*string) {
 	for _, input := range inputs {
 		ma := protocol.MapAssignment{
-			Input:  input,
-			Offset: 0,
-			Length: -1,
-			Plugin: plugin,
+			Input:    input,
+			Offset:   0,
+			Length:   -1,
+			Function: t.mapF,
+			NReduce:  t.nReduce,
 		}
-		aw := &aWrapper{a: &protocol.Assignment{Map: ma, TaskID: t.id}, state: aReady}
-		t.mA[aw.a.ID()] = aw
+		aw := &aWrapper{a: &ma, state: aReady}
+		t.mA[ma.AssignmentID()] = aw
 	}
 	t.nMap = len(t.mA)
 }
@@ -265,16 +286,13 @@ func (t *task) kill() {
 	t.state = tDead
 }
 
-func (t *task) cancel(a *protocol.Assignment) {
+func (t *task) cancel(a protocol.Assignment) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if a.IsMap() {
-		wa, ok := t.mA[a.ID()]
-		if ok {
-			wa.state = aReady
-		}
+	if wa, ok := t.mA[a.AssignmentID()]; ok {
+		wa.state = aReady
 	} else {
-		wa, ok := t.rA[a.ID()]
+		wa, ok := t.rA[a.AssignmentID()]
 		if ok {
 			wa.state = aReady
 		}
@@ -287,7 +305,7 @@ func (t *task) isDead() bool {
 	return t.state == tDead
 }
 
-func (t *task) assign() *protocol.Assignment {
+func (t *task) assign() protocol.Assignment {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.state == tMapping {
@@ -308,21 +326,21 @@ func (t *task) assign() *protocol.Assignment {
 	return nil
 }
 
-func (t *task) finish(a *protocol.Assignment, outputs map[int]string) {
+func (t *task) finish(a protocol.Assignment, outputs map[int]*string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.state == tMapping {
-		aw, ok := t.mA[a.ID()]
+		aw, ok := t.mA[a.AssignmentID()]
 		if ok {
 			for hash, path := range outputs {
-				t.tempsToAW[path] = aw
+				t.tempsToAW[*path] = aw
 				t.temps[hash] = append(t.temps[hash], path)
 			}
 			aw.state = aDone
 			t.doneMap++
 		}
 	} else if t.state == tReducing {
-		aw, ok := t.rA[a.ID()]
+		aw, ok := t.rA[a.AssignmentID()]
 		if ok {
 			for hash, path := range outputs {
 				t.results[hash] = path
@@ -341,24 +359,29 @@ func (t *task) proceed() {
 
 		if len(t.rA) == 0 {
 			for hash, paths := range t.temps {
+				hs := strconv.Itoa(hash)
 				ra := protocol.ReduceAssignment{
-					Inputs: paths,
-					Hash:   strconv.Itoa(hash),
-					Plugin: t.plugin,
+					Inputs:   paths,
+					Hash:     &hs,
+					TID:      t.id,
+					Function: t.reduceF,
 				}
-				aw := &aWrapper{a: &protocol.Assignment{Reduce: ra, TaskID: t.id}, state: aReady}
-				t.rA[aw.a.ID()] = aw
+				aw := &aWrapper{a: &ra, state: aReady}
+				t.rA[ra.AssignmentID()] = aw
 			}
 		} else {
 			for _, aw := range t.rA {
 				if aw.state == aBlocked {
-					h, err := strconv.Atoi(aw.a.Reduce.Hash)
-					if err != nil {
-						log.Println("invalid hash")
-						continue
+					ra, ok := aw.a.(*protocol.ReduceAssignment)
+					if ok {
+						h, err := strconv.Atoi(*ra.Hash)
+						if err != nil {
+							log.Println("invalid hash")
+							continue
+						}
+						ra.Inputs = t.temps[h]
+						aw.state = aReady
 					}
-					aw.a.Reduce.Inputs = t.temps[h]
-					aw.state = aReady
 				}
 			}
 		}
@@ -379,10 +402,10 @@ func (t *task) isDone() bool {
 	return t.state == tDone
 }
 
-func (t *task) redoTemp(ra *protocol.Assignment, path string) error {
+func (t *task) redoTemp(ra protocol.Assignment, path *string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	maw, _ := t.tempsToAW[path]
+	maw, _ := t.tempsToAW[*path]
 	removed := make(map[string]bool)
 	for temp, other := range t.tempsToAW {
 		if maw == other {
@@ -390,9 +413,9 @@ func (t *task) redoTemp(ra *protocol.Assignment, path string) error {
 		}
 	}
 	for h, l := range t.temps {
-		var temps []string
+		var temps []*string
 		for _, temp := range l {
-			if !removed[temp] {
+			if !removed[*temp] {
 				temps = append(temps, temp)
 			}
 		}
@@ -400,7 +423,7 @@ func (t *task) redoTemp(ra *protocol.Assignment, path string) error {
 	}
 	t.doneMap--
 	maw.state = aReady
-	raw := t.rA[ra.ID()]
+	raw := t.rA[ra.AssignmentID()]
 	raw.state = aBlocked
 	t.state = tMapping
 	return nil

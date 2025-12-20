@@ -22,25 +22,26 @@ func TestMakeTask(t *testing.T) {
 	}
 	var mSize int64 = 1
 	nMap := len(content) / int(mSize)
+	mapF := func(k string, c string) []protocol.KeyValue { return nil }
+	reduceF := func(k string, v []string) string { return "" }
 
 	tests := []struct {
 		name     string
-		inputs   []string
+		inputs   []*string
 		nReduce  int
-		plugin   string
 		opts     []taskOption
 		expMA    int
 		expRA    int
 		expMSize int64
 	}{
-		{"Single File", []string{file1}, 10, "pg", []taskOption{}, 1, 0, 32 * 1024 * 1024},
-		{"Multiple Files", []string{file1, file2}, 10, "pg", []taskOption{}, 2, 0, 32 * 1024 * 1024},
-		{"With", []string{file1}, 10, "pg", []taskOption{withMapSize(mSize)}, nMap, 0, mSize},
+		{"Single File", []*string{&file1}, 10, []taskOption{}, 1, 0, 32 * 1024 * 1024},
+		{"Multiple Files", []*string{&file1, &file2}, 10, []taskOption{}, 2, 0, 32 * 1024 * 1024},
+		{"With", []*string{&file1}, 10, []taskOption{withMapSize(mSize), withMapF(mapF), withReduceF(reduceF)}, nMap, 0, mSize},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			task, err := makeTask(test.inputs, test.nReduce, test.plugin, test.opts...)
+			task, err := makeTask(test.inputs, test.nReduce, test.opts...)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -53,8 +54,11 @@ func TestMakeTask(t *testing.T) {
 			if task.nReduce != test.nReduce {
 				t.Errorf("got nReduce %d, want %d", task.nReduce, test.nReduce)
 			}
-			if task.plugin != test.plugin {
-				t.Errorf("got plugin %s, want %s", task.plugin, test.plugin)
+			if task.mapF != nil && len(test.opts) == 0 {
+				t.Errorf("got mapF, want nil")
+			}
+			if task.reduceF != nil && len(test.opts) == 0 {
+				t.Errorf("got reduceF, want nil")
 			}
 			if task.mSize != int64(test.expMSize) {
 				t.Errorf("got mSize %d, want %d", task.mSize, test.expMSize)
@@ -84,7 +88,7 @@ func getTestTask(t *testing.T, i int) *task {
 		t.Fatal(err)
 	}
 
-	task, err := makeTask([]string{file}, 1, "", withMapSize(int64(1)))
+	task, err := makeTask([]*string{&file}, 1, withMapSize(int64(1)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +110,7 @@ func TestAssign(t *testing.T) {
 	taskE := getTestTask(t, 3)
 	taskDead := getTestTask(t, 4)
 	taskR.state = tReducing
-	taskR.rA["1"] = &aWrapper{a: &protocol.Assignment{}, state: aReady}
+	taskR.rA["1"] = &aWrapper{a: &protocol.ReduceAssignment{}, state: aReady}
 	taskD.state = tDone
 	taskDead.kill()
 	for taskE.assign() != nil {
@@ -136,10 +140,10 @@ func TestAssign(t *testing.T) {
 			if !test.isNil && a == nil {
 				t.Errorf("task.assign() should return assignment")
 			}
-			if test.isMap && !a.IsMap() {
+			if _, ok := a.(*protocol.MapAssignment); test.isMap && !ok {
 				t.Errorf("task.assign() should return map assignment")
 			}
-			if !test.isMap && a.IsMap() {
+			if _, ok := a.(*protocol.ReduceAssignment); !test.isMap && !ok {
 				t.Errorf("task.assign() should return reduce assignment")
 			}
 		})
@@ -150,8 +154,8 @@ func TestCancel(t *testing.T) {
 	taskM := getTestTask(t, 0)
 	taskR := getTestTask(t, 1)
 	taskR.state = tReducing
-	a := &protocol.Assignment{TaskID: taskR.id}
-	taskR.rA[a.ID()] = &aWrapper{a: a, state: aReady}
+	a := &protocol.ReduceAssignment{TID: taskR.id}
+	taskR.rA[a.AssignmentID()] = &aWrapper{a: a, state: aReady}
 
 	tests := []struct {
 		name string
@@ -162,7 +166,7 @@ func TestCancel(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			var a *protocol.Assignment
+			var a protocol.Assignment
 			for {
 				temp := test.task.assign()
 				if temp == nil {
@@ -188,12 +192,14 @@ func TestFinish(t *testing.T) {
 		if a == nil {
 			t.Fatalf("task.assign() should return assignment")
 		}
-		if !a.IsMap() {
+		if _, ok := a.(*protocol.MapAssignment); !ok {
 			t.Fatalf("task.assign() should return map assignment")
 		}
-		outputs := make(map[int]string)
-		outputs[0] = a.ID() + "temp0"
-		outputs[1] = a.ID() + "temp1"
+		outputs := make(map[int]*string)
+		name0 := fmt.Sprintf("%vtemp0", a.AssignmentID())
+		outputs[0] = &name0
+		name1 := fmt.Sprintf("%vtemp1", a.AssignmentID())
+		outputs[1] = &name1
 		task.finish(a, outputs)
 	}
 	if task.state != tReducing {
@@ -206,10 +212,11 @@ func TestFinish(t *testing.T) {
 		if a == nil {
 			t.Fatalf("task.assign() should return assignment")
 		}
-		if a.IsMap() {
+		ra, ok := a.(*protocol.ReduceAssignment)
+		if !ok {
 			t.Fatalf("task.assign() should return reduce assignment")
 		}
-		h, err := strconv.Atoi(a.Reduce.Hash)
+		h, err := strconv.Atoi(*ra.Hash)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -220,8 +227,9 @@ func TestFinish(t *testing.T) {
 			t.Fatalf("reduce assignment %d is out of range", h)
 		}
 		seen[h] = true
-		outputs := make(map[int]string)
-		outputs[h] = fmt.Sprintf("%v_result_%v", a.ID(), h)
+		outputs := make(map[int]*string)
+		nameO := fmt.Sprintf("%v_result_%v", a.TaskID(), h)
+		outputs[h] = &nameO
 		task.finish(a, outputs)
 	}
 	if task.state != tDone {
@@ -236,10 +244,16 @@ func TestRedoTemp(t *testing.T) {
 		if a == nil {
 			t.Fatalf("task.assign() should return assignment")
 		}
-		offset := int(a.Map.Offset)
-		outputs := make(map[int]string)
-		outputs[0] = fmt.Sprintf("offset_%v_hash_%v", offset, 0)
-		outputs[1] = fmt.Sprintf("offset_%v_hash_%v", offset, 1)
+		ma, ok := a.(*protocol.MapAssignment)
+		if !ok {
+			t.Fatalf("task.assign() should return map assignment")
+		}
+		offset := int(ma.Offset)
+		outputs := make(map[int]*string)
+		name0 := fmt.Sprintf("offset_%v_hash_%v", offset, 0)
+		name1 := fmt.Sprintf("offset_%v_hash_%v", offset, 1)
+		outputs[0] = &name0
+		outputs[1] = &name1
 		task.finish(a, outputs)
 	}
 
@@ -247,10 +261,11 @@ func TestRedoTemp(t *testing.T) {
 	if a == nil {
 		t.Fatalf("task.assign() should return assignment")
 	}
-	if a.IsMap() {
-		t.Fatalf("task.assign() should return reduce assignment")
+	ra, ok := a.(*protocol.ReduceAssignment)
+	if !ok {
+		t.Fatalf("task.assign() should return map assignment")
 	}
-	temp := a.Reduce.Inputs[0]
+	temp := ra.Inputs[0]
 	err := task.redoTemp(a, temp)
 	if err != nil {
 		t.Fatal(err)
@@ -262,20 +277,23 @@ func TestRedoTemp(t *testing.T) {
 	if a == nil {
 		t.Fatalf("task.assign() should return assignment")
 	}
-	if !a.IsMap() {
+	ma, ok := a.(*protocol.MapAssignment)
+	if !ok {
 		t.Fatalf("task.assign() should return map assignment")
 	}
-	offset, err := strconv.Atoi(strings.Split(temp, "_")[1])
+	offset, err := strconv.Atoi(strings.Split(*temp, "_")[1])
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.Map.Offset != int64(offset) {
+	if ma.Offset != int64(offset) {
 		t.Fatalf("task.assign() should return map assignment of offset %v", offset)
 	}
 
-	outputs := make(map[int]string)
-	outputs[0] = fmt.Sprintf("offset_%v_hash_%v", offset, 0)
-	outputs[1] = fmt.Sprintf("offset_%v_hash_%v", offset, 1)
+	outputs := make(map[int]*string)
+	name0 := fmt.Sprintf("offset_%v_hash_%v", offset, 0)
+	name1 := fmt.Sprintf("offset_%v_hash_%v", offset, 1)
+	outputs[0] = &name0
+	outputs[1] = &name1
 	task.finish(a, outputs)
 
 	seen := make(map[int]bool, task.nReduce)
@@ -284,10 +302,11 @@ func TestRedoTemp(t *testing.T) {
 		if a == nil {
 			t.Fatalf("task.assign() should return assignment")
 		}
-		if a.IsMap() {
+		ra, ok := a.(*protocol.ReduceAssignment)
+		if !ok {
 			t.Fatalf("task.assign() should return reduce assignment")
 		}
-		h, err := strconv.Atoi(a.Reduce.Hash)
+		h, err := strconv.Atoi(*ra.Hash)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -298,8 +317,9 @@ func TestRedoTemp(t *testing.T) {
 			t.Fatalf("reduce assignment %d is out of range", h)
 		}
 		seen[h] = true
-		outputs := make(map[int]string)
-		outputs[h] = fmt.Sprintf("%v_result_%v", a.ID(), h)
+		outputs := make(map[int]*string)
+		nameO := fmt.Sprintf("%v_result_%v", a.TaskID(), h)
+		outputs[h] = &nameO
 		task.finish(a, outputs)
 	}
 	if task.state != tDone {
@@ -329,8 +349,8 @@ func TestIntegratedAM(t *testing.T) {
 		expNMap    int
 		expNReduce int
 	}{
-		{"small", protocol.StartTaskRequest{small, smallMSize, 10, ""}, smallNMap, 10},
-		{"large", protocol.StartTaskRequest{large, largeMSize, 20, ""}, largeNMap, 20},
+		{"small", protocol.StartTaskRequest{&small, smallMSize, 10, nil, nil}, smallNMap, 10},
+		{"large", protocol.StartTaskRequest{&large, largeMSize, 20, nil, nil}, largeNMap, 20},
 	}
 
 	for _, test := range tests {
@@ -346,14 +366,16 @@ func TestIntegratedAM(t *testing.T) {
 				if a == nil {
 					t.Fatalf("am.assignTask() should return assignment")
 				}
-				if !a.IsMap() {
+				ma, ok := a.(*protocol.MapAssignment)
+				if !ok {
 					t.Fatalf("missing map assignment")
 				}
-				outputs := make(map[int]string)
+				outputs := make(map[int]*string)
 				for i := 0; i < test.expNReduce; i++ {
-					outputs[i] = fmt.Sprintf("offset_%v_hash_%v", a.Map.Offset, i)
+					name := fmt.Sprintf("offset_%v_hash_%v", ma.Offset, i)
+					outputs[i] = &name
 				}
-				am.finishAssignment(worker, outputs)
+				am.finishAssignment(&worker, outputs)
 			}
 			d, err := am.isTaskDone(id)
 			if err != nil {
@@ -368,16 +390,18 @@ func TestIntegratedAM(t *testing.T) {
 				if a == nil {
 					t.Fatalf("am.assignTask() should return assignment")
 				}
-				if a.IsMap() {
+				ra, ok := a.(*protocol.ReduceAssignment)
+				if !ok {
 					t.Fatalf("task.assign() should return reduce assignment")
 				}
-				outputs := make(map[int]string)
-				h, err := strconv.Atoi(a.Reduce.Hash)
+				outputs := make(map[int]*string)
+				h, err := strconv.Atoi(*ra.Hash)
 				if err != nil {
 					t.Fatal(err)
 				}
-				outputs[h] = fmt.Sprintf("result_hash_%v", h)
-				am.finishAssignment(worker, outputs)
+				name := fmt.Sprintf("result_hash_%v", h)
+				outputs[h] = &name
+				am.finishAssignment(&worker, outputs)
 			}
 			d, err = am.isTaskDone(id)
 			if err != nil {
@@ -391,7 +415,7 @@ func TestIntegratedAM(t *testing.T) {
 				t.Fatal(err)
 			}
 			for h, path := range results {
-				if path != fmt.Sprintf("result_hash_%v", h) {
+				if *path != fmt.Sprintf("result_hash_%v", h) {
 					t.Fatalf("mismatched result")
 				}
 			}
