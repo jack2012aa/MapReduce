@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"net/rpc"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type Coordinator struct {
 	lastHeartbeats map[string]time.Time
-	isAlive        bool
+	isClosed       atomic.Bool
+	srv            *http.Server
 	timeout        time.Duration
 	am             *assignmentManager
 	mu             sync.Mutex
@@ -21,7 +23,7 @@ type Coordinator struct {
 func MakeCoordinatorDaemon() (*Coordinator, string) {
 	c := Coordinator{
 		lastHeartbeats: make(map[string]time.Time),
-		isAlive:        true,
+		isClosed:       atomic.Bool{},
 		timeout:        time.Second * 10,
 		am:             newAssignmentManager(),
 	}
@@ -59,6 +61,7 @@ func (c *Coordinator) checkHeartBeat() {
 			if delta > c.timeout {
 				c.am.maybeUnassign(&s)
 			}
+			delete(c.lastHeartbeats, s)
 		}
 	}
 }
@@ -124,15 +127,36 @@ func (c *Coordinator) GetResult(args protocol.GetResultRequest, reply *protocol.
 	return nil
 }
 
-func (c *Coordinator) server() string {
-	rpc.Register(c)
+func (c *Coordinator) ReportError(args protocol.ReportErrorRequest, reply *protocol.ReportErrorResponse) error {
+	c.am.maybeUnassign(args.Source)
+	log.Printf("Worker %v fails because of %v", args.Source, args.Error)
+	return nil
+}
 
-	rpc.HandleHTTP()
+func (c *Coordinator) server() string {
+	rpcServer := rpc.NewServer()
+	rpcServer.Register(c)
+	mux := http.NewServeMux()
+	mux.Handle(rpc.DefaultRPCPath, rpcServer)
+	mux.Handle(rpc.DefaultDebugPath, rpcServer)
+
 	l, err := net.Listen("tcp", ":0")
 	if err != nil {
 		log.Fatal("listen error:", err)
 	}
-	log.Println("listening on", l.Addr())
-	go http.Serve(l, nil)
-	return l.Addr().String()
+	addr := l.Addr().String()
+	log.Printf("Coordinator listening at %s", addr)
+
+	c.srv = &http.Server{Handler: mux}
+	go func() {
+		if err := c.srv.Serve(l); err != nil {
+			log.Printf("Coordinator failed to serve: %v", err)
+		}
+	}()
+	return addr
+}
+
+func (c *Coordinator) Close() {
+	c.isClosed.Store(true)
+	c.srv.Close()
 }

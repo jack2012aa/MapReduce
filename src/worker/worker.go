@@ -2,13 +2,15 @@ package worker
 
 import (
 	"MapReduce/src/protocol"
+	"errors"
 	"fmt"
-	"hash/fnv"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
+	"path"
+	"path/filepath"
 	"plugin"
 	"sync"
 	"sync/atomic"
@@ -23,19 +25,14 @@ type WorkerDaemon struct {
 	run             int
 	isClosed        atomic.Bool
 	mu              sync.Mutex
-	mapF            func(string, string) []KeyValue
+	mapF            func(string, string) []protocol.KeyValue
 	reduceF         func(string, []string) string
 	dir             string
 }
 
-type KeyValue struct {
-	Key   string
-	Value string
-}
-
 type WorkerDaemonOption func(*WorkerDaemon)
 
-func WithMapF(f func(string, string) []KeyValue) WorkerDaemonOption {
+func WithMapF(f func(string, string) []protocol.KeyValue) WorkerDaemonOption {
 	return func(wd *WorkerDaemon) {
 		wd.mapF = f
 	}
@@ -68,18 +65,19 @@ func MakeWorkerDaemon(coordinatorAddr string, opts ...WorkerDaemonOption) *Worke
 }
 
 func (wd *WorkerDaemon) startFileServer() {
+	mux := http.NewServeMux()
+	mux.Handle("/", http.FileServer(http.Dir(wd.dir)))
+
 	listener, err := net.Listen("tcp", ":0")
 	if err != nil {
 		log.Fatal("start file server error:", err)
 	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	fs := http.FileServer(http.Dir(wd.dir))
+	wd.port = listener.Addr().(*net.TCPAddr).Port
 	go func() {
-		if err := http.Serve(listener, fs); err != nil {
+		if err := http.Serve(listener, mux); err != nil {
 			log.Printf("http serve error: %s", err)
 		}
 	}()
-	wd.port = port
 }
 
 func (wd *WorkerDaemon) setAddr() {
@@ -108,7 +106,7 @@ func (wd *WorkerDaemon) heartbeat() {
 	q := protocol.HeartBeatRequest{Source: &addr}
 	p := &protocol.HeartBeatResponse{}
 	for !wd.isClosed.Load() {
-		err := wd.client.Call("Coordinator.Heartbeat", q, p)
+		err := wd.client.Call("Coordinator.HeartBeat", q, p)
 		if err != nil {
 			log.Println("heartbeat error:", err)
 		}
@@ -120,20 +118,20 @@ func (wd *WorkerDaemon) addr() string {
 	return fmt.Sprintf("%v:%v", *wd.host, wd.port)
 }
 
-func (wd *WorkerDaemon) askAssignment() protocol.Assignment {
+func (wd *WorkerDaemon) askAssignment() (protocol.Assignment, error) {
 	addr := wd.addr()
 	q := protocol.AskAssignmentRequest{Source: &addr}
 	p := &protocol.AskAssignmentResponse{}
 	err := wd.client.Call("Coordinator.AskAssignment", q, p)
 	if err != nil {
-		log.Fatal("assign worker error:", err)
+		return nil, errors.New("assign worker error: " + err.Error())
 	}
-	return p.A
+	return p.A, nil
 }
 
 // load the application Map and Reduce functions
 // from a plugin file, e.g. ../mrapps/wc.so
-func (wd *WorkerDaemon) loadPlugin(filename string) (func(string, string) []KeyValue, func(string, []string) string) {
+func (wd *WorkerDaemon) loadPlugin(filename string) (func(string, string) []protocol.KeyValue, func(string, []string) string) {
 	p, err := plugin.Open(filename)
 	if err != nil {
 		log.Fatalf("cannot load plugin %v", filename)
@@ -142,7 +140,7 @@ func (wd *WorkerDaemon) loadPlugin(filename string) (func(string, string) []KeyV
 	if err != nil {
 		log.Fatalf("cannot find Map in %v", filename)
 	}
-	mapf := xmapf.(func(string, string) []KeyValue)
+	mapf := xmapf.(func(string, string) []protocol.KeyValue)
 	xreducef, err := p.Lookup("Reduce")
 	if err != nil {
 		log.Fatalf("cannot find Reduce in %v", filename)
@@ -158,26 +156,20 @@ func (wd *WorkerDaemon) reportError(err error) {
 	wd.client.Call("Coordinator.ReportError", q, p)
 }
 
-func (wd *WorkerDaemon) ihash(key string) int {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return int(h.Sum32() & 0x7fffffff)
-}
-
 func (wd *WorkerDaemon) workAt(a protocol.Assignment) {
-	dir := fmt.Sprintf("%v", a.TaskID())
-	err := os.Mkdir(dir, 0777)
-	if err != nil {
-		wd.reportError(err)
-		return
+	taskDir := fmt.Sprintf("%v", a.TaskID())
+	absTaskDir := filepath.Join(wd.dir, taskDir)
+	_, err := os.Stat(absTaskDir)
+	if os.IsNotExist(err) {
+		err = os.Mkdir(absTaskDir, 0777)
 	}
 	_, isMap := a.(*protocol.MapAssignment)
 	if wd.mapF != nil && isMap {
 		a.SetF(wd.mapF)
-	} else if wd.reduceF != nil && isMap {
+	} else if wd.reduceF != nil && !isMap {
 		a.SetF(wd.reduceF)
 	}
-	outputs, err := a.Execute(dir)
+	outputs, err := a.Execute(absTaskDir)
 	if err != nil {
 		wd.reportError(err)
 		return
@@ -185,7 +177,8 @@ func (wd *WorkerDaemon) workAt(a protocol.Assignment) {
 	addr := wd.addr()
 	if isMap {
 		for i, p := range outputs {
-			outputs[i] = fmt.Sprintf("http://%v%v", addr, p)
+			p = path.Join(taskDir, p)
+			outputs[i] = fmt.Sprintf("http://%v/%v", addr, p)
 		}
 	}
 	outputsP := make(map[int]*string, len(outputs))
@@ -200,7 +193,7 @@ func (wd *WorkerDaemon) workAt(a protocol.Assignment) {
 }
 
 func (wd *WorkerDaemon) Start() {
-	client, err := rpc.Dial("tcp", *wd.coordinatorAddr)
+	client, err := rpc.DialHTTP("tcp", *wd.coordinatorAddr)
 	if err != nil {
 		log.Fatal("dialing:", err)
 	}
@@ -210,8 +203,10 @@ func (wd *WorkerDaemon) Start() {
 	wd.register()
 	go wd.heartbeat()
 	for i := 0; wd.run == -1 || i < wd.run; {
-		a := wd.askAssignment()
-		if a != nil {
+		a, err := wd.askAssignment()
+		if err != nil {
+			wd.reportError(err)
+		} else if a != nil {
 			wd.workAt(a)
 			i++
 		} else {
@@ -224,7 +219,7 @@ func (wd *WorkerDaemon) Close() {
 	wd.isClosed.Store(true)
 }
 
-func Worker(coordinatorAddr string, mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+func Worker(coordinatorAddr string, mapf func(string, string) []protocol.KeyValue, reducef func(string, []string) string) {
 	wd := MakeWorkerDaemon(coordinatorAddr, WithMapF(mapf), WithReduceF(reducef), WithRun(1))
 	wd.Start()
 	wd.Close()

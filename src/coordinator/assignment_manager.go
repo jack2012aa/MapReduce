@@ -47,7 +47,7 @@ func (am *assignmentManager) addTask(r protocol.StartTaskRequest) (*protocol.ID,
 func (am *assignmentManager) addTaskFromFiles(inputs []*string, nReduce int) (protocol.ID, error) {
 	t, err := makeTask(inputs, nReduce)
 	if err != nil {
-		return protocol.ID{}, err
+		return "", err
 	}
 	am.mu.Lock()
 	defer am.mu.Unlock()
@@ -115,7 +115,7 @@ func (am *assignmentManager) finishAssignment(worker *string, outputs map[int]*s
 	delete(am.wToA, *worker)
 	t.finish(a, outputs)
 	if t.isDone() || t.isDead() {
-		slices.DeleteFunc(am.workingTasks, func(task *task) bool {
+		am.workingTasks = slices.DeleteFunc(am.workingTasks, func(task *task) bool {
 			return task == t
 		})
 	}
@@ -205,7 +205,7 @@ func makeTask(inputs []*string, nReduce int, opts ...taskOption) (*task, error) 
 	t := &task{
 		mSize:     32 * 1024 * 1024,
 		nReduce:   nReduce,
-		id:        protocol.ID(uuid.New()),
+		id:        protocol.ID(uuid.New().String()),
 		mA:        make(map[string]*aWrapper, 10),
 		rA:        make(map[string]*aWrapper, nReduce),
 		temps:     make(map[int][]*string),

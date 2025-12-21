@@ -10,13 +10,13 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"plugin"
 	"runtime/debug"
 	"slices"
 	"strconv"
-
-	"github.com/google/uuid"
+	"strings"
 )
 
 func init() {
@@ -29,7 +29,7 @@ type KeyValue struct {
 	Value string
 }
 
-type ID uuid.UUID
+type ID string
 
 func loadPlugin(filename *string) (func(string, string) []KeyValue, func(string, []string) string, error) {
 	p, err := plugin.Open(*filename)
@@ -101,9 +101,17 @@ func (a *MapAssignment) Execute(dir string) (outputs map[int]string, err error) 
 		return nil, err
 	}
 
+	info, err := input.Stat()
+	if err != nil {
+		return nil, err
+	}
+	l := info.Size() - a.Offset
+	if l < a.Length {
+		a.Length = l
+	}
 	buffer := make([]byte, a.Length)
 	_, err = io.ReadFull(input, buffer)
-	if err != nil {
+	if err != nil && err != io.EOF {
 		return nil, err
 	}
 	contents := string(buffer)
@@ -116,7 +124,6 @@ func (a *MapAssignment) Execute(dir string) (outputs map[int]string, err error) 
 	encoders := make([]*json.Encoder, a.NReduce)
 	outputFiles := make([]*os.File, a.NReduce)
 	outputs = make(map[int]string, a.NReduce)
-	err = os.Mkdir(dir, 0777)
 	if err != nil {
 		return nil, err
 	}
@@ -141,13 +148,13 @@ func (a *MapAssignment) Execute(dir string) (outputs map[int]string, err error) 
 
 	for i, file := range outputFiles {
 		file.Close()
-		filename := fmt.Sprintf("/%v/mr-%v-%v", dir, a.TaskID(), i)
+		filename := fmt.Sprintf("mr-%v-%v", a.AssignmentID(), i)
+		filename = filepath.Join(dir, filename)
 		os.Rename(file.Name(), filename)
-		wd, err := os.Getwd()
 		if err != nil {
 			return nil, err
 		}
-		outputs[i] = fmt.Sprintf("%s/%s", wd, filename)
+		outputs[i] = path.Base(filename)
 	}
 
 	return outputs, nil
@@ -167,7 +174,9 @@ func (a *MapAssignment) TaskID() ID {
 }
 
 func (a *MapAssignment) AssignmentID() string {
-	return fmt.Sprintf("t_%v_i_%v_o_%v", a.TID, a.Input, a.Offset)
+	n := path.Base(*a.Input)
+	n = strings.Split(n, ".")[0]
+	return fmt.Sprintf("t_%v_i_%v_o_%v", a.TID, n, a.Offset)
 }
 
 type FileAccessError struct {
@@ -215,6 +224,13 @@ func (a *ReduceAssignment) downloadAndDecode(url string) ([]KeyValue, error) {
 //
 // If it is a reduce assignment, may return FileAccessError
 func (a *ReduceAssignment) Execute(dir string) (outputs map[int]string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("ReduceF panic: %v\nStack Trace:\n%s", r, debug.Stack())
+			outputs = nil
+		}
+	}()
+
 	if a.Function == nil {
 		_, reduceF, err := loadPlugin(a.Plugin)
 		if err != nil {
@@ -237,10 +253,6 @@ func (a *ReduceAssignment) Execute(dir string) (outputs map[int]string, err erro
 		return cmp.Compare(a.Key, b.Key)
 	})
 
-	err = os.MkdirAll(dir, 0777)
-	if err != nil {
-		return nil, err
-	}
 	filename := filepath.Join(dir, fmt.Sprintf("mr-out-%v", a.Hash))
 	output, err := os.Create(filename)
 	if err != nil {
@@ -262,11 +274,12 @@ func (a *ReduceAssignment) Execute(dir string) (outputs map[int]string, err erro
 	if err != nil {
 		return nil, err
 	}
-	path, err := filepath.Abs(output.Name())
+	p, err := filepath.Abs(output.Name())
 	if err != nil {
 		return nil, err
 	}
-	outputs[h] = path
+	outputs = make(map[int]string, h+1)
+	outputs[h] = p
 	return outputs, nil
 }
 
